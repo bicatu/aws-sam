@@ -1,0 +1,10 @@
+version = 0.1
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "cold-start"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-u5xo5jiz1toz"
+s3_prefix = "cold-start"
+region = "us-west-2"
+capabilities = "CAPABILITY_IAM"
+image_repositories = []

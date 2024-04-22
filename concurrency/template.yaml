@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  concurrency
+
+  testing concurrency
+  
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 30
+
+Parameters:
+  ParameterInstancePrefix:
+    Type: String
+    Default: "CC"
+    Description: "Prefix to be used in names of the things created by this stack."
+
+Resources:
+  SourceQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Join ["",[!Ref ParameterInstancePrefix,'-',"ConcurrencyControlledSource"]]
+
+  StartSFFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: src/
+      Handler: startSF.handler
+      Runtime: nodejs18.x
+      Policies:
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt StateMachineConcurrencyControl.Name
+      Events:
+        StartSFEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SourceQueue.Arn
+            BatchSize: 1
+      Architectures:
+        - x86_64
+    Metadata: # Manage esbuild properties
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: "es2020"
+        Sourcemap: true
+        EntryPoints: 
+        - startSF.ts
+
+  ConvertTimeFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: src/
+      Handler: convert-time.handler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+    Metadata: # Manage esbuild properties
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: "es2020"
+        Sourcemap: true
+        EntryPoints: 
+        - convert-time.ts
+
+  DoWorkFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: src/
+      Handler: doWork.handler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+    Metadata: # Manage esbuild properties
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: "es2020"
+        Sourcemap: true
+        EntryPoints: 
+        - doWork.ts
+
+  ConcurrencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: concurrency-control
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: "ttl"
+
+  ApplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "states.amazonaws.com"
+                - "lambda.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: AppPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                - events:PutTargets
+                - events:PutRule
+                - events:DescribeRule
+                - states:StartExecution
+                - states:SendTaskSuccess
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+                - xray:GetSamplingRules
+                - xray:GetSamplingTargets
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+                - cloudwatch:PutMetricData
+                Resource: '*'
+              -
+                Effect: Allow
+                Action:
+                - lambda:InvokeFunction
+                Resource: '*'
+              - 
+                Effect: Allow
+                Action:
+                - dynamodb:UpdateItem
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                Resource: "*"
+                
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Main statemachine that runs the tests  
+  StateMachineConcurrencyControl:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachines/concurrency.asl.json
+      DefinitionSubstitutions:
+        DoWorkFunction: !GetAtt DoWorkFunction.Arn
+        ConcurrencyTable: !Ref ConcurrencyTable
+        CreateSemaphoreStateMachine: !GetAtt StateMachineCreateSemaphore.Arn
+      Tracing:
+        Enabled: true
+      Role: !GetAtt ApplicationRole.Arn
+      Type: "STANDARD"
+      Name: !Join ["",[!Ref ParameterInstancePrefix,'-',"ConcurrencyControlledStateMachine"]]
+
+  StateMachineCreateSemaphore:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachines/create-lock.asl.json
+      DefinitionSubstitutions:
+        ConcurrencyTable: !Ref ConcurrencyTable
+        ConvertTimeFunction: !GetAtt ConvertTimeFunction.Arn
+      Tracing:
+        Enabled: true
+      Role: !GetAtt ApplicationRole.Arn
+      Type: "STANDARD"
+      Name: !Join ["",[!Ref ParameterInstancePrefix,'-',"CreateSemaphoreStateMachine"]]
+
+  StateMachineCleanSemaphore:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachines/remove-lock-from-failure.asl.json
+      DefinitionSubstitutions:
+        ConcurrencyTable: !Ref ConcurrencyTable
+      Tracing:
+        Enabled: true
+      Role: !GetAtt ApplicationRole.Arn
+      Type: "STANDARD"
+      Name: !Join ["",[!Ref ParameterInstancePrefix,'-',"CleanSemaphore"]]
+      Events:
+        RunForIncomplete:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - "aws.states"
+              detail:
+                stateMachineArn: 
+                  - !Ref StateMachineConcurrencyControl
+                status:
+                  - FAILED
+                  - TIMED_OUT
+                  - ABORTED
+
+Outputs:
+  # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
+  # Find out more about other implicit resources you can reference within SAM
+  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
+  StartSFFunction:
+    Description: "Start SF Lambda Function ARN"
+    Value: !GetAtt StartSFFunction.Arn
+  doWorkFunction:
+    Description: "Do Work Lambda Function ARN"
+    Value: !GetAtt DoWorkFunction.Arn

@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  api-gw-kinesis
+  Sample SAM Template for api-gw-kinesis
+Globals:
+  Function:
+    Timeout: 3
+    Tracing: Active
+  Api:
+    TracingEnabled: true
+Resources:
+  HelloWorldFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.lambdaHandler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt KinesisStream.Arn
+            StartingPosition: LATEST
+            BatchSize: 100
+      Policies:
+        - KinesisStreamReadPolicy:
+            StreamName: !Ref KinesisStream
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt SaveForFuture.QueueName
+      Environment:
+        Variables:
+          SAVEFORFUTURE_QUEUE_NAME: !GetAtt SaveForFuture.QueueName
+          SAVEFORFUTURE_QUEUE_ARN: !GetAtt SaveForFuture.Arn
+          SAVEFORFUTURE_QUEUE_URL: !Ref SaveForFuture
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints:
+          - app.ts
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+  APIGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+      Policies:
+        - PolicyName: APIGatewayKinesisPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                Resource: !Sub
+                  - ${varStreamArn}*
+                  - varStreamArn: !GetAtt KinesisStream.Arn
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: apigw-kinesis-integration
+      Description: Kinesis integration REST API
+  streams:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: streams
+  streamName:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref streams
+      PathPart: '{stream-name}'
+  record:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref streamName
+      PathPart: record
+  recordMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref record
+      HttpMethod: POST
+      ApiKeyRequired: false
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        Credentials: !GetAtt APIGatewayRole.Arn
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:kinesis:action/PutRecord
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "StreamName": "$input.params('stream-name')",
+              "Data": "$util.base64Encode($input.json('$'))",
+              "PartitionKey": "$input.path('$.duStatus.duStatusLines[0].orderId')"
+            }
+        IntegrationResponses:
+          - StatusCode: '200'
+      MethodResponses:
+        - StatusCode: '200'
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - recordMethodPost
+    Properties:
+      RestApiId: !Ref Api
+      StageName: dev
+  SaveForFuture:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 345600
+Outputs:
+  HelloWorldFunction:
+    Description: Hello World Lambda Function ARN
+    Value: !GetAtt HelloWorldFunction.Arn
+  HelloWorldFunctionIamRole:
+    Description: Implicit IAM Role created for Hello World function
+    Value: !GetAtt HelloWorldFunctionRole.Arn
+  ApiRootUrl:
+    Description: Root Url of the API
+    Value: !Sub
+      - https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/dev
+      - ApiId: !Ref Api
+  KinesisStream:
+    Description: Kinesis Data Stream name
+    Value: !Ref KinesisStream

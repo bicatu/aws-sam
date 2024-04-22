@@ -1,0 +1,197 @@
+{
+  "Comment": "Creates a semaphore and returns to the caller workflow after obtaining it",
+  "StartAt": "Convert Time",
+  "TimeoutSeconds": 3600,
+  "States": {
+    "Convert Time": {
+      "Type": "Task",
+      "Resource": "${ConvertTimeFunction}",
+      "ResultPath": "$.startTimeEpoch",
+      "Next": "Get Semaphore"
+    },
+    "Get Semaphore": {
+      "Comment": "Acquirea a semaphore. If not possible retries because someone already has it retries prior confirming if the same owner already has a semaphore",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${ConcurrencyTable}",
+        "Key": {
+          "PK": {
+            "S.$": "$.concurrencyKey"
+          }
+        },
+        "ExpressionAttributeNames": {
+          "#count": "count",
+          "#semaphoreOwnerid.$": "$.AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID",
+          "#ttl": "ttl"
+        },
+        "ExpressionAttributeValues": {
+          ":increase": {
+            "N": "1"
+          },
+          ":limit": {
+            "N.$": "$.maxConcurrencyLimit"
+          },
+          ":now": {
+            "S.$": "$$.State.EnteredTime"
+          },
+          ":ttl": {
+            "N.$": "$.ttl"
+          },
+          ":initTtl": {
+            "N.$": "$.startTimeEpoch"
+          }
+        },
+        "UpdateExpression": "SET #count = #count + :increase, #semaphoreOwnerid = :now, #ttl = if_not_exists(#ttl, :initTtl) + :ttl",
+        "ConditionExpression": "#count <> :limit and attribute_not_exists(#semaphoreOwnerid)",
+        "ReturnValues": "UPDATED_NEW"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.AmazonDynamoDBException"
+          ],
+          "MaxAttempts": 0
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 6,
+          "BackoffRate": 2,
+          "IntervalSeconds": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.AmazonDynamoDBException"
+          ],
+          "Next": "Initialize Lock Item",
+          "ResultPath": "$.semaphoreinfo.acquisitionerror"
+        },
+        {
+          "ErrorEquals": [
+            "DynamoDB.ConditionalCheckFailedException"
+          ],
+          "Next": "Get Current semaphore Record",
+          "ResultPath": "$.semaphoreinfo.acquisitionerror"
+        }
+      ],
+      "ResultPath": null,
+      "Next": "Resume Caller Workflow"
+    },
+    "Initialize Lock Item": {
+      "Comment": "This state handles the case where an item hasn't been created for this semaphore yet. A conditonal expression to fail if the an item with that key already exists, which avoids a race condition if multiple executions start at the same time. There are other reasons that the previous state could fail and end up here, so this is safe in those cases too.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${ConcurrencyTable}",
+        "Item": {
+          "PK": {
+            "S.$": "$.concurrencyKey"
+          },
+          "count": {
+            "N": "0"
+          }
+        },
+        "ConditionExpression": "PK <> :lockname",
+        "ExpressionAttributeValues": {
+          ":lockname": {
+            "S.$": "$.concurrencyKey"
+          }
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.AmazonDynamoDBException"
+          ],
+          "MaxAttempts": 5,
+          "BackoffRate": 2,
+          "IntervalSeconds": 60
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Get Semaphore",
+          "ResultPath": null
+        }
+      ],
+      "Next": "Get Semaphore",
+      "ResultPath": null
+    },
+    "Get Current semaphore Record": {
+      "Comment": "Usually called when the limit has been exceeded. there is however is an edge case if the semaphore is already acquired",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:getItem",
+      "Parameters": {
+        "TableName": "${ConcurrencyTable}",
+        "ExpressionAttributeNames": {
+          "#semaphoreOwnerid.$": "$.AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID"
+        },
+        "Key": {
+          "PK": {
+            "S.$": "$.concurrencyKey"
+          }
+        },
+        "ProjectionExpression": "#semaphoreOwnerid"
+      },
+      "ResultSelector": {
+        "Item.$": "$.Item",
+        "ItemString.$": "States.JsonToString($.Item)"
+      },
+      "ResultPath": "$.semaphoreinfo.currentsemaphoreitem",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.SdkClientException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 5,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "Check Already Acquired"
+    },
+    "Check Already Acquired": {
+      "Comment": "Tests the edge case where the semaphore is already acquired, this should never happend unless you use the same semaphore ID more than once or check for the semaphore multiple times",
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.semaphoreinfo.currentsemaphoreitem.ItemString",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.semaphoreinfo.currentsemaphoreitem.ItemString",
+              "StringMatches": "*Z*"
+            }
+          ],
+          "Next": "Resume Caller Workflow"
+        }
+      ],
+      "Default": "Wait For Semaphore"
+    },
+    "Wait For Semaphore": {
+      "Type": "Wait",
+      "SecondsPath": "$.waitTimeInSeconds",
+      "Next": "Get Semaphore"
+    },
+    "Resume Caller Workflow": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sfn:sendTaskSuccess",
+      "Parameters": {
+        "TaskToken.$": "$.token",
+        "Output": {
+          "success": true
+        }
+      },
+      "End": true
+    }
+  }
+}

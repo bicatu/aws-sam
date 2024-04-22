@@ -1,0 +1,86 @@
+{
+    "Comment": "A state machine to demonstrate using DynamoDB to implement a semaphore",
+    "StartAt": "Get Semaphore",
+    "States": {
+      "Get Semaphore": {
+        "Comment": "Cpart of your statemachine that is responsible for doing the work.",
+        "Type": "Task",
+        "Resource": "arn:aws:states:::states:startExecution.waitForTaskToken",
+        "HeartbeatSeconds": 3600,
+        "ResultPath": "$.semaphoreResult",
+        "Parameters": {
+          "StateMachineArn": "${CreateSemaphoreStateMachine}",
+          "Input": {
+            "token.$": "$$.Task.Token",
+            "concurrencyKey.$": "$.concurrencyKey",
+            "maxConcurrencyLimit.$": "$.maxConcurrencyLimit",
+            "waitTimeInSeconds.$": "$.waitTimeInSeconds",
+            "ttl": "3600",
+            "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+          }
+        },
+        "Catch": [
+          {
+            "ErrorEquals": [ "States.Timeout" ],
+            "Next": "Do Work"
+          }
+        ],
+        "Next": "Do Work"
+      },
+      "Do Work": {
+        "Type": "Task",
+        "Resource": "arn:aws:states:::lambda:invoke",
+        "Parameters": {
+          "FunctionName": "${DoWorkFunction}"
+        },
+        "ResultPath": "$.output",
+        "Next": "Remove Semaphore"
+      },
+      "Remove Semaphore": {
+        "Type": "Task",
+        "Resource": "arn:aws:states:::dynamodb:updateItem",
+        "Parameters": {
+          "TableName": "${ConcurrencyTable}",
+          "Key": {
+            "PK": {
+              "S.$": "$.concurrencyKey"
+            }
+          },
+          "ExpressionAttributeNames": {
+            "#count": "count",
+            "#semaphoreOwnerid.$": "$$.Execution.Id"
+          },
+          "ExpressionAttributeValues": {
+            ":decrease": {
+            "N": "1"
+          }
+          },
+          "UpdateExpression": "SET #count = #count - :decrease REMOVE #semaphoreOwnerid",
+          "ConditionExpression": "attribute_exists(#semaphoreOwnerid)",
+          "ReturnValues": "UPDATED_NEW"
+        },
+        "Catch": [
+          {
+            "ErrorEquals": [ "States.ALL" ],
+            "Next": "Success",
+            "ResultPath": null
+          }
+        ],
+        "Retry": [
+          {
+          "ErrorEquals": [ "DynamoDB.ConditionalCheckFailedException" ],
+          "MaxAttempts": 0
+          },
+          {
+            "ErrorEquals": [ "States.ALL" ],
+            "MaxAttempts": 5,
+            "BackoffRate": 1.5
+          }
+        ],
+        "Next": "Success"
+      },
+      "Success": {
+        "Type": "Succeed"
+      }
+    }
+}
